@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import os,sys
 """Greedy decoding with the original .pth via the rwkv pip package.
 
 Usage: python greedy_ref.py <checkpoint path without .pth>
 Used to check that a GGUF conversion produces the same output in llama.cpp.
 """
+import os, sys
 os.environ["RWKV_V7_ON"]="1"; os.environ["RWKV_JIT_ON"]="1"; os.environ["RWKV_CUDA_ON"]="0"
 import torch
 from rwkv.model import RWKV
