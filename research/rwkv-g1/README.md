@@ -1,7 +1,7 @@
 # RWKV-7 G1 as the IME student backbone: first findings
 
-Date: 2026-11-01. Status: tokenizer audit and pip-runtime CPU benchmark done;
-native-runtime (llama.cpp / rwkv.cpp, int8) benchmark **not yet run**.
+Date: 2026-11-01. Status: tokenizer audit, pip-runtime CPU benchmark and
+llama.cpp (F16 / Q8_0) CPU benchmark done.
 
 ## Context
 
@@ -98,17 +98,54 @@ Interpretation:
 - Multi-token prefill is much cheaper per token than single steps
   (16 tokens ≈ 3 steps), which supports verifying the previous keystroke's
   best candidate in one pass instead of decoding step by step.
-- The ~26 ms per step mostly comes from the pip package's per-operation
-  Python/PyTorch overhead; the body is only ~90M multiply-accumulates per
-  token. A native int8 runtime is expected to be far faster, **but this has
-  not been measured yet**.
+- Part of the ~26 ms per step is the pip package's per-operation
+  Python/PyTorch overhead; see the llama.cpp results below for a native runtime.
 - State snapshots for Backspace rollback are cheap.
+
+## CPU benchmark: llama.cpp
+
+Same machine. llama.cpp commit `dde879b` (2026-11-01), CPU build with
+`GGML_NATIVE=ON`, 4 threads, `llama-bench -p 16,64,256 -n 64 -r 5`.
+
+Weights: the F16 GGUF from
+https://huggingface.co/shoumenchougou/RWKV7-G1d-0.1B-GGUF (linked from the
+official model card), file `rwkv7-g1d-0.1b-20260129-ctx8192-FP16.gguf`,
+sha256 `6d41c88ecbd6e84dc46f146eace701c5981f7bd1691bf6de4d7cbfcb5a9f6afc`
+(matches the published LFS hash). Q8_0 was produced locally with
+`llama-quantize ... Q8_0`.
+
+Correctness check (`scripts/greedy_ref.py` against `llama-simple`, greedy, 40
+tokens, prompt `User: 请用一句话介绍北京。\n\nAssistant:`): the F16 GGUF output is
+identical to the original `.pth` run through the `rwkv` package. Q8_0 agrees
+for the first 21 characters, then diverges, which is ordinary quantisation
+noise.
+
+| Format | Size | Prefill 16 | Prefill 64 | Prefill 256 | Decode, per token |
+|---|---|---|---|---|---|
+| F16 | 367 MiB | 502 t/s (≈32 ms) | 699 t/s (≈92 ms) | 799 t/s (≈320 ms) | 69.2 t/s (**≈14.4 ms**) |
+| Q8_0 | 201 MiB | 368 t/s (≈44 ms) | 532 t/s (≈120 ms) | 657 t/s (≈390 ms) | 93.4 t/s (**≈10.7 ms**) |
+
+Interpretation:
+
+- Native decoding is about 2.4× faster than the pip package (10.7 vs 25.9 ms
+  per token), less than hoped. At batch 1, Q8_0 reads its ~201 MiB of weights
+  per token; 201 MiB per 10.7 ms is ≈20 GB/s, which is consistent with decoding
+  being memory-bandwidth-bound on this machine (inferred, not profiled).
+- On that reading, the full 65,536-way head (≈26% of the parameters) is a
+  matching share of each step's cost, which again favours the factorised head.
+- Q8_0 is faster for decoding but slower for prefill than F16 on this CPU.
+  An IME would want F16 or a better-tuned kernel for draft verification and Q8_0
+  (or lower) for step-by-step decoding; measure before choosing.
+- Verifying a 16-character draft costs ≈32 ms (F16). That is acceptable but
+  not comfortable for one keystroke. The 0.4B model (≈3× the body
+  parameters) would land around the 100 ms level on this CPU class unless the
+  head is factorised and weights go to 4–5 bits. This is an estimate, not a
+  measurement.
 
 ## Next steps
 
-1. Benchmark the same checkpoint in a native runtime (llama.cpp `rwkv7` GGUF,
-   int8) for single-step and 16-token-prefill latency. That result decides
-   whether the 0.4B (≈3× the body) is affordable.
+1. Benchmark Q4/Q5 variants and the 0.4B model in llama.cpp; profile to
+   confirm whether decoding is bandwidth-bound.
 2. Vocabulary extension tool: add the missing characters, initialise their
    embeddings from their UTF-8 byte tokens, and round-trip test on mixed
    Chinese, English, code and rare-character text.
@@ -122,6 +159,25 @@ pip install torch rwkv==0.8.32
 python3 -I scripts/vocab_coverage.py rwkv_vocab_v20230424.txt general_standard_8105.txt
 python scripts/bench_head.py rwkv7-g1d-0.1b-20260129-ctx8192.pth 4
 python scripts/bench_rwkv_pip.py rwkv7-g1d-0.1b-20260129-ctx8192 4
+python scripts/greedy_ref.py rwkv7-g1d-0.1b-20260129-ctx8192
+```
+
+llama.cpp:
+
+```bash
+cmake -S llama.cpp -B llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF
+```
+
+```bash
+cmake --build llama.cpp/build -j4 --target llama-bench llama-quantize llama-simple
+```
+
+```bash
+llama.cpp/build/bin/llama-quantize g1d-0.1b-f16.gguf g1d-0.1b-q8_0.gguf Q8_0 4
+```
+
+```bash
+llama.cpp/build/bin/llama-bench -m g1d-0.1b-f16.gguf,g1d-0.1b-q8_0.gguf -p 16,64,256 -n 64 -t 4 -r 5
 ```
 
 Data files and checkpoints are not committed; fetch them from the URLs above
