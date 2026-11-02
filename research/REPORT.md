@@ -1,9 +1,16 @@
 # IrisTectorum: research report to date
 
 Period covered: 2026-11-01 to 2026-11-02.
-Scope: review of an external IME architecture proposal, the decisions taken
-since, the proposed end-to-end design, and the first measurements on a
-candidate base model (RWKV-7 G1).
+
+Scope:
+
+- review of an external IME architecture proposal
+- the decisions taken since
+- the proposed end-to-end design
+- the first measurements on a candidate base model (RWKV-7 G1)
+- the character inventory
+- synthetic data
+- corpus strategy and licensing stance
 
 Labels used throughout:
 
@@ -37,6 +44,16 @@ Labels used throughout:
    costs ≈10 µs instead of ≈5–7 ms in PyTorch (**Measured**). The 0.4B student is
    likely too slow on this CPU class without a factorised head and 4–5-bit
    weights (**Unverified**, estimate).
+7. A dictionary-grounded character inventory (现代汉语词典 7th ed. + 中華語文大辭典)
+   is **≈15.2k characters**: 11.2k on the simplified side, 12.1k on the
+   traditional side. RWKV lacks ≈7.3k of them (**Measured**, §8).
+8. Gemini-generated sentences are **not** a high-quality starting corpus. Their
+   errors concentrate in rare characters (non-words, misuse, mixed or Japanese
+   forms), and their register is ornate prose. They are admissible only as a
+   capped, checked supplement (**Decision** on policy, **Measured** evidence, §9).
+9. The product ships **code and model weights only**. Licence review is
+   deferred to before release, but every data source is recorded in
+   `research/data_manifest.md` from now on (**Decision**, §11).
 
 ---
 
@@ -110,6 +127,9 @@ lattice with neural re-ranking. Gboard's FST-plus-neural-LM decoder
 | D1 | End-to-end neural IME | Research-led product. A lattice-plus-reranker hybrid was proposed and set aside. |
 | D2 | Privacy and threat model deferred to after the first release | Covers: local keystroke stores, ambient-context scraping, learned data resurfacing, retroactive edits, update-channel integrity. |
 | D3 | Adapt a pretrained model instead of pretraining from scratch | Make the tokenizer character-level for Chinese, then continue training. |
+| D4 | Ship code and model weights only | No dictionary tables or corpora are distributed. Runtime tables must come from clearly redistributable sources. |
+| D5 | Licence review deferred to before release; provenance recorded from now on | `research/data_manifest.md` |
+| D6 | Synthetic (LLM-generated) text only as a capped, checked, tagged supplement | Never as the base corpus and never in evaluation sets |
 
 ---
 
@@ -366,7 +386,179 @@ Correctness, checked with greedy decoding of 40 tokens on a Chinese prompt:
 
 ---
 
-## 8. Environment constraints
+## 8. Character inventory: simplified and traditional (Measured)
+
+Details and scripts: `research/data-analysis/`.
+
+### 8.1 Via OpenCC
+
+| Set | Characters | Single tokens in RWKV | Missing |
+|---|---|---|---|
+| 通用规范汉字表 | 8,105 | 5,982 | 2,123 |
+| Traditional / variant forms not in the table | 2,919 | 1,624 | 1,295 |
+| Union | 11,024 | 7,606 | 3,418 |
+| Level 1 + traditional forms | 4,928 | 4,823 (97.9%) | 105 |
+
+The common core is already covered; the gap is in the rare tail.
+
+### 8.2 Via the two dictionaries
+
+| Set | Characters | Single tokens in RWKV |
+|---|---|---|
+| Simplified side (现汉 + CSLD simplified) | 11,182 | 6,154 |
+| Traditional side (CSLD traditional + 现汉 traditional forms) | 12,124 | 6,125 |
+| Union | 15,177 | 7,854 |
+
+Further results from the dictionaries:
+
+- **Homophone groups** (现汉, toneless, before cleaning): median 15, p90 44,
+  max 165 (*yi*). This bounds the factorised head's per-step choice.
+- **Polyphones:** 654 single-character headwords have several readings.
+- **Taiwan vs mainland readings:** 2,311 of the 7,976 CSLD entries that give both
+  pinyins differ even without tones. The input simulation must accept both.
+- **Traditional ↔ simplified:** 274 simplified characters map to more than one
+  traditional form. CSLD's word-level pairs resolve most of these better than
+  OpenCC's character table.
+
+### 8.3 Implications for teacher and student
+
+- Teacher and student receive the **same vocabulary extension** (same IDs).
+- The teacher's new rows must be **trained before distillation**, otherwise
+  the student learns noise.
+- The student's loss combines ground-truth cross-entropy with teacher KL. The
+  KL weight is reduced where the gold character is rare or newly added.
+- The teacher is checked per register (simplified, traditional) and on
+  new-character positions, not only on averages.
+
+### 8.4 Traditional characters: open product question
+
+- Native traditional output needs genuine traditional text; converted
+  simplified text inherits conversion errors.
+- Most Taiwan users type Zhuyin, not pinyin; Hong Kong users are split across
+  Cangjie, Quick and others. Supporting them changes the key encoder and its
+  input simulation, not just the vocabulary.
+
+---
+
+## 9. Synthetic (Gemini) text (Measured evidence, Decision D6)
+
+Two Gemini-generated lists of 100 graded sentences were analysed
+(`research/data-analysis/README.md` §3).
+
+- **Narrow coverage.** List A has 1,028 distinct characters and List B 1,264,
+  with only 2–3 level-3 and 5 out-of-table characters each. They cannot test an
+  11–15k inventory.
+- **Dictionary attestation.** Of non-level-1 occurrences, 17% (A) and 12% (B)
+  do not sit inside any dictionary word. Manual review splits these into real
+  errors and classical terms missing from modern dictionaries.
+  - Real errors in A: 黓暗, 龫发, 龆龀好学, 繾绻 (mixed script), and an ASCII full stop.
+  - Real errors in B: 渓 (Japanese form) and 鸊鷉 (traditional).
+- **Semantic misuse slips through.** 蹀躞起舞 passes the dictionary check
+  although the sense is wrong.
+- **Register.** The prose is ornate and repetitive (斑驳, 璀璨夺目, 宛如, 展现出),
+  far from what people type.
+
+Why not as a base corpus:
+
+- Errors concentrate where the teacher's prior is weakest, so the IME would
+  learn to propose non-words.
+- The register pulls the model towards essay prose.
+- Repeated training on model output erodes the rare tail (Shumailov et al.,
+  Nature 2024; cited from memory).
+- Google's terms may restrict training use (unverified).
+
+Policy (D6):
+
+1. Real attestations come first.
+2. Generation is used only for characters below a minimum count of real
+   examples.
+3. Generated sentences must pass four filters: inventory, script consistency,
+   dictionary attestation, then semantic review.
+4. Synthetic text is capped at a few per cent, tagged, and never used for
+   evaluation.
+
+Of the two lists, List B is the better probe once 渓 → 溪 and 鸊鷉 → 䴙䴘 are
+fixed. Even then it is a smoke test, not an evaluation set.
+
+---
+
+## 10. Corpus strategy
+
+### 10.1 "Junk" has two kinds for an IME
+
+Standard web filters prefer textbook-like prose: C4-style heuristics,
+educational-value classifiers (FineWeb-Edu style), CCI3.0-HQ's classifier. An
+IME needs chat, comments, fragments, slang and code-switching, which those
+filters rank lowest.
+
+| Kind | Examples | Treatment |
+|---|---|---|
+| Junk for both | Gambling and adult SEO spam, boilerplate, garbled encodings, machine translation, keyword stuffing, near-duplicates | Remove |
+| Junk for an LLM, signal for an IME | Casual chat, forum replies, comments, fragments, slang, code-switching | Keep, with its own quota |
+| LLM-generated text in recent crawls | Fluent but unlike typing | Separate category, kept low |
+
+### 10.2 Sources by role
+
+Availability and licences of the open corpora below were not checked
+(**Unverified**).
+
+- **Teacher continued training:** open Chinese pretraining corpora such as
+  CCI3.0-HQ (≈500 GB), MAP-CC (≈800B tokens) and the OpenCSG
+  Fineweb-edu-chinese series. Good for knowledge and formal registers;
+  educationally biased.
+- **Rare characters:** classical and literary text.
+  - A candidate is the `bookraw` corpus in a separate project (329 authors,
+    ≈4,268 works in its catalogue). Pre-modern authors spotted include
+    左传, 李清照, 宋之问, 宋祁, 洪应明 (菜根谭), 高明, 周德清 and 唐玄宗.
+  - Which works are actually present in its cleaned data, and how much text is
+    pre-modern, has not been confirmed.
+  - To check there: script per copy, deduplication across editions, and
+    copyright of modern authors.
+- **Traditional:** genuine traditional-script sources (Taiwan and Hong Kong
+  text), not conversions.
+- **IME register:** conversational text; licensing is the main constraint.
+
+### 10.3 Dictionaries as filters
+
+1. **Per-character targets.** Count corpus occurrences of each inventory
+   character and set a minimum (e.g. 50) for new characters. Mine real text
+   first and generate only for the remainder.
+2. **Garbled text and spam.** Use the share of a document's characters that
+   fall outside the 15,177-character inventory or into private-use or
+   compatibility ranges.
+3. **Keyword stuffing.** After segmentation, combine the out-of-dictionary
+   word rate with the repetition rate.
+
+### 10.4 Evaluation
+
+- Use real held-out text per register: formal, conversational, classical and
+  traditional, deduplicated against training data.
+- Report bits per character and homophone ranking per register, plus a
+  rare-character breakdown.
+
+---
+
+## 11. Licensing stance (Decision D4, D5)
+
+- **Output risk is low.** The model only completes short spans in response to
+  typing.
+- **Obligations remain on use and distribution.** These are:
+  - shipping dictionary-derived tables, which D4 rules out;
+  - contractual terms on model outputs used for training;
+  - provenance questions at publication or weight release.
+- **Two habits from now on:**
+  1. Record every source in `research/data_manifest.md`.
+  2. Build any runtime table the code needs from clearly redistributable
+     sources.
+- **Unverified points:**
+  - China's 生成式人工智能服务管理暂行办法 requires lawful training-data
+    sources. Whether it applies to an IME is unclear.
+  - CSLD is believed to be CC BY-NC-ND 3.0 TW.
+  - 现代汉语词典 is proprietary and used here for research only.
+
+---
+
+## 12. Environment constraints
 
 - The cloud container is CPU-only.
 - Pretraining or distillation here is infeasible. For example, 0.1B on 1B
@@ -379,7 +571,7 @@ Correctness, checked with greedy decoding of 40 tokens on a Chinese prompt:
 
 ---
 
-## 9. Open questions and risks
+## 13. Open questions and risks
 
 1. **Chinese strength of RWKV G1.** The Chinese share of training data is
    unpublished, so it needs a bits-per-character measurement against a Qwen
@@ -394,10 +586,17 @@ Correctness, checked with greedy decoding of 40 tokens on a Chinese prompt:
    realistic model sizes and pipeline scope.
 6. **First target platform** (macOS IMK, Windows TSF, Linux fcitx5/IBus,
    mobile) is undecided.
+7. **Traditional-character scope.** Pinyin users only, or Zhuyin (Taiwan) and
+   Cangjie/Quick (Hong Kong) users too? This changes the key encoder, not just
+   the vocabulary (§8.4).
+8. **Real-text coverage of the ≈7.3k new characters.** Unknown until
+   per-character counts are run on the chosen corpora, including `bookraw`.
+9. **Licences** of CSLD, the open corpora and Gemini output are unverified
+   (deferred, D5).
 
 ---
 
-## 10. Next steps
+## 14. Next steps
 
 1. Run llama.cpp benchmarks of Q4/Q5 formats and the 0.4B model, and profile
    decoding.
@@ -409,6 +608,14 @@ Correctness, checked with greedy decoding of 40 tokens on a Chinese prompt:
 4. Run the LFM2-350M arm of the bake-off on the same metrics.
 5. Prototype the data pipeline: polyphone-aware pinyin, mixed-abbreviation and
    prefix simulation, Shuangpin generation.
+6. Clean the dictionary pinyin and build the target inventory and homophone
+   groups. Fix `ɡ`, split multi-reading fields, strip homograph indices, and
+   handle the sandhi marks.
+7. Write a standalone per-character coverage counter to run on `bookraw`
+   (`books_cleaned.parquet`) and other corpora, split by 文言/白话 and by script,
+   with deduplication by work.
+8. Build the synthetic-text gate (inventory, script, attestation, review) for
+   characters still short of real examples.
 
 ---
 
@@ -431,7 +638,21 @@ Correctness, checked with greedy decoding of 40 tokens on a Chinese prompt:
 - LFM2-700M: https://huggingface.co/LiquidAI/LFM2-700M
 - LFM2-350M ONNX: https://huggingface.co/onnx-community/LFM2-350M-ONNX
 
+**Character and dictionary data** (details and hashes in `research/data_manifest.md`)
+
+- OpenCC: https://github.com/BYVoid/OpenCC
+- 中華語文大辭典 data: https://github.com/g0v/moedict-data-csld
+- 现代汉语词典 7th ed. word list: supplied by the project, not public
+
+**Chinese corpora** (availability and licences unverified)
+
+- CCI3.0-HQ: https://arxiv.org/pdf/2410.18505
+- OpenCSG Chinese Corpus: https://arxiv.org/pdf/2501.08197
+- MAP-CC: https://app.alphaneural.io/datasets/m-a-p/MAP-CC
+
 **Literature** (cited from memory, not re-checked during this work)
+
+- Shumailov et al., Nature 2024, on training with model-generated data
 
 - Jelassi et al., 2024, *Repeat After Me*
 - Ouyang et al., 2017, *Mobile keyboard input decoding with finite-state transducers*
